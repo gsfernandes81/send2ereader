@@ -1,7 +1,13 @@
 # Debian slim rather than Alpine: PyMuPDF (needed by pdfCropMargins) publishes prebuilt
 # glibc wheels for amd64 and arm64, but none for musl, so on Alpine it compiles MuPDF from
 # source, which is slow and memory-hungry on a small server.
-FROM docker.io/library/node:lts-slim
+#
+# Pinned by digest (the multi-arch index) so CI's registry layer cache stays valid: a
+# floating tag would move under it every few weeks and turn a small change into a full
+# pull on the server. Moving the digest is the deliberate way to get a newer Node and
+# fresh Debian packages. To find the current one:
+#   docker buildx imagetools inspect node:24-bookworm-slim
+FROM docker.io/library/node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 
 # Create app directory
 WORKDIR /usr/src/app

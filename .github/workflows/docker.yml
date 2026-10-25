@@ -1,0 +1,151 @@
+name: docker
+
+# Build the image for arm64 (the Pi that runs it) and amd64, smoke test each one, and on
+# master publish both as one multi-arch image:
+#
+#   ghcr.io/gsfernandes81/send2ereader:<commit sha>
+#
+# The tag is the full commit sha, the same one infra's deployments/send2ereader/SOURCE
+# pins, so a tag always means one commit. Other branches build and test, and publish
+# nothing.
+#
+# NATIVE RUNNERS, NO EMULATION. Each architecture builds and runs its smoke test on its
+# own GitHub runner (free for public repos), so an x86-only binary on arm64 fails here
+# rather than on the server. Each leg pushes its image by digest only, and the publish
+# job joins the two digests under the tag.
+#
+# CACHE-COMPATIBLE LAYERS, the same way infra builds gsrpi-dev-base (its
+# .github/workflows/dev-base.yml has the reasoning):
+#
+#   cache       type=registry, mode=max, in this package under buildcache-arm64 and
+#               buildcache-amd64. One tag per architecture because the legs are separate
+#               jobs and each would otherwise overwrite the other's cache. A step whose
+#               instruction and inputs are unchanged reuses the cached blob, so the layer
+#               keeps its digest and a Pi that has it pulls nothing. Only master writes
+#               the cache, so a branch cannot replace it; branches read it.
+#   zstd        both the image and the cache, OCI media types. The cache must be zstd too,
+#               or every run would re-compress gzip cache blobs into new digests. zstd
+#               decompresses faster on ARM and needs Docker 23 or newer to pull.
+#   the base    pinned by digest in the Dockerfile, so the cache is not invalidated by a
+#               floating tag.
+#
+# The package must be public for the Pi to pull without a credential: one visibility
+# flip in the package settings after the first push.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Two master pushes in a row would race on the cache tags; queue them instead.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/send2ereader
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            # KindleGen only exists for x86, so the image leaves it out on arm64
+            kindlegen: false
+          - arch: amd64
+            runner: ubuntu-24.04
+            kindlegen: true
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr
+        if: github.ref == 'refs/heads/master'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Loaded into the runner's docker for the smoke test. A missing cache (the first
+      # run, or a private package on a branch) is a warning, not a failure.
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          provenance: false
+          tags: send2ereader:ci
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+
+      - name: Smoke test
+        run: sh test/smoke.sh send2ereader:ci ${{ matrix.kindlegen }}
+
+      # The same build again, now entirely from the builder's cache, pushed by digest
+      # with no tag. The publish job tags it once both legs have passed.
+      - name: Push by digest
+        id: push
+        if: github.ref == 'refs/heads/master'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,compression=zstd,oci-mediatypes=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.arch }},mode=max,compression=zstd,oci-mediatypes=true
+
+      - name: Keep the digest for the publish job
+        if: github.ref == 'refs/heads/master'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        if: github.ref == 'refs/heads/master'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag both architectures as one image
+        working-directory: digests
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          [ "$(ls | wc -l)" = 2 ] || { echo "expected 2 digests, got: $(ls)" >&2; exit 1; }
+          docker buildx imagetools create -t "$IMAGE:$TAG" $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+          echo "Pushed \`$IMAGE:$TAG\` (arm64, amd64)." >> "$GITHUB_STEP_SUMMARY"
