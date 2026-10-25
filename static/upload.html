@@ -182,6 +182,23 @@ siteurl.textContent = window.location.href
 siteurl.href = siteurl.textContent
 siteurl.target = '_self'
 
+// Untick and disable conversions this server can't run (e.g. KindleGen on ARM)
+var toolsreq = new XMLHttpRequest()
+toolsreq.open('GET', './tools', true)
+toolsreq.onload = function () {
+	if (toolsreq.status != 200) return
+	var tools = JSON.parse(toolsreq.responseText)
+	for (var name in tools) {
+		var checkbox = document.getElementById(name)
+		if (!checkbox || tools[name]) continue
+		checkbox.checked = false
+		checkbox.disabled = true
+		var label = document.querySelector('label[for="' + name + '"]')
+		if (label) label.appendChild(document.createTextNode(' (not available on this server)'))
+	}
+}
+toolsreq.send()
+
 </script>
 </body>
 </html>

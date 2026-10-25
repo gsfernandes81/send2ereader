@@ -1,40 +1,53 @@
-# node 20 is lts at the time of writing
-FROM docker.io/library/node:lts-alpine AS build
+# Debian slim rather than Alpine: PyMuPDF (needed by pdfCropMargins) publishes prebuilt
+# glibc wheels for amd64 and arm64, but none for musl, so on Alpine it compiles MuPDF from
+# source, which is slow and memory-hungry on a small server.
+FROM docker.io/library/node:lts-slim
 
 # Create app directory
 WORKDIR /usr/src/app
 
-RUN apk add --no-cache pipx gcc g++ make pkgconf python3-dev clang-dev musl-dev
+# curl is only used for the downloads below
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl python3 python3-venv && \
+    rm -rf /var/lib/apt/lists/*
 
-ENV PATH="$PATH:/root/.local/bin"
+# Install pdfCropMargins from prebuilt wheels only, so a missing wheel fails the build
+# instead of compiling MuPDF. PyMuPDF 2 adds onnxruntime, numpy and other packages for
+# features pdfCropMargins does not use, so stay on 1.x.
+RUN python3 -m venv /opt/pdfcropmargins && \
+    /opt/pdfcropmargins/bin/pip install --no-cache-dir --only-binary=:all: pdfCropMargins "PyMuPDF<2" && \
+    ln -s /opt/pdfcropmargins/bin/pdfcropmargins /usr/local/bin/pdfcropmargins
 
-RUN pipx install pdfCropMargins
-
-FROM docker.io/library/node:lts-alpine as runtime
-
-# Copy pdfCropMargins install
-COPY --from=build /root/.local /root/.local
-
-RUN apk add --no-cache python3
-
-ENV PATH="$PATH:/root/.local/bin"
-
-# Download and install kepubify
-RUN wget https://github.com/pgaskin/kepubify/releases/download/v4.0.4/kepubify-linux-64bit && \
-    mv kepubify-linux-64bit /usr/local/bin/kepubify && \
+# Download and install kepubify for the image's architecture
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset=kepubify-linux-64bit; sum=37d7628d26c5c906f607f24b36f781f306075e7073a6fe7820a751bb60431fc5 ;; \
+      arm64) asset=kepubify-linux-arm64; sum=5a15b8f6f6a96216c69330601bca29638cfee50f7bf48712795cff88ae2d03a3 ;; \
+      *) echo "kepubify: unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/kepubify "https://github.com/pgaskin/kepubify/releases/download/v4.0.4/$asset"; \
+    echo "$sum  /usr/local/bin/kepubify" | sha256sum -c; \
     chmod +x /usr/local/bin/kepubify
 
-# Download and install kindlegen
-RUN wget https://github.com/zzet/fp-docker/raw/f2b41fb0af6bb903afd0e429d5487acc62cb9df8/kindlegen_linux_2.6_i386_v2_9.tar.gz && \
-    echo "9828db5a2c8970d487ada2caa91a3b6403210d5d183a7e3849b1b206ff042296 kindlegen_linux_2.6_i386_v2_9.tar.gz" | sha256sum -c && \
-    mkdir kindlegen && \
-    tar xvf kindlegen_linux_2.6_i386_v2_9.tar.gz --directory kindlegen && \
-    cp kindlegen/kindlegen /usr/local/bin/kindlegen && \
-    chmod +x /usr/local/bin/kindlegen && \
-    rm -rf kindlegen
+# Download and install kindlegen. It only exists as a 32-bit x86 binary, so it is left
+# out on other architectures (e.g. arm64): the app detects that and disables the
+# KindleGen option on the upload page.
+RUN set -eu; \
+    if [ "$(dpkg --print-architecture)" = amd64 ]; then \
+      curl -fsSL -o /tmp/kindlegen.tar.gz https://github.com/zzet/fp-docker/raw/f2b41fb0af6bb903afd0e429d5487acc62cb9df8/kindlegen_linux_2.6_i386_v2_9.tar.gz; \
+      echo "9828db5a2c8970d487ada2caa91a3b6403210d5d183a7e3849b1b206ff042296  /tmp/kindlegen.tar.gz" | sha256sum -c; \
+      mkdir /tmp/kindlegen; \
+      tar xf /tmp/kindlegen.tar.gz --directory /tmp/kindlegen; \
+      install -m 755 /tmp/kindlegen/kindlegen /usr/local/bin/kindlegen; \
+      rm -rf /tmp/kindlegen /tmp/kindlegen.tar.gz; \
+    else \
+      echo "kindlegen: no build for $(dpkg --print-architecture), skipping"; \
+    fi
 
-# Copy files needed by npm install
+# Copy files needed by npm install (patches/ is used by the patch-package postinstall)
 COPY package*.json ./
+COPY patches ./patches
 
 # Install app dependencies
 RUN npm install --omit=dev
@@ -43,7 +56,7 @@ RUN npm install --omit=dev
 COPY . ./
 
 # Create uploads directory if it doesn't exist
-RUN mkdir uploads
+RUN mkdir -p uploads
 
 EXPOSE 3001
 CMD [ "npm", "start" ]

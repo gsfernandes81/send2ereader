@@ -28,3 +28,5 @@ docker compose build
 docker compose up -d
 ```
 5. Access the service on HTTP, default port 3001 (http://localhost:3001)
+
+The image builds on amd64 and arm64 and downloads the matching kepubify binary. KindleGen only exists as a 32-bit x86 binary, so on arm64 it is left out and the KindleGen option on the upload page is disabled.

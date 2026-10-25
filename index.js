@@ -30,6 +30,26 @@ const allowedExtensions = ['epub', 'mobi', 'pdf', 'cbz', 'cbr', 'html', 'txt']
 const keyChars = "23456789ACDEFGHJKLMNPRSTUVWXYZ"
 const keyLength = 4
 
+function onPath (cmd) {
+  return (process.env.PATH || '').split(':').some((dir) => {
+    try {
+      fs.accessSync(join(dir || '.', cmd), fs.constants.X_OK)
+      return true
+    } catch (err) {
+      return false
+    }
+  })
+}
+
+// Conversion tools found at startup. One that is missing (e.g. kindlegen, which only
+// exists for x86) is never run, and the upload page disables its checkbox.
+const tools = {
+  kepubify: onPath('kepubify'),
+  kindlegen: onPath('kindlegen'),
+  pdfcropmargins: onPath('pdfcropmargins')
+}
+console.log('Conversion tools available:', tools)
+
 
 function doTransliterate(filename) {
   let name = filename.split(".")
@@ -315,7 +335,7 @@ router.post('/upload', async (ctx, next) => {
       filename = filename.replace(/[^\.\w\-"'\(\)]/g, '_')
     }
 
-    if (mimetype === TYPE_EPUB && info.agent.includes('Kindle') && ctx.request.body.kindlegen) {
+    if (mimetype === TYPE_EPUB && info.agent.includes('Kindle') && ctx.request.body.kindlegen && tools.kindlegen) {
       // convert to .mobi
       conversion = 'kindlegen'
       const outname = ctx.request.file.path.replace(/\.epub$/i, '.mobi')
@@ -373,7 +393,7 @@ router.post('/upload', async (ctx, next) => {
         return
       }
 
-    } else if (mimetype === TYPE_EPUB && info.agent.includes('Kobo') && ctx.request.body.kepubify) {
+    } else if (mimetype === TYPE_EPUB && info.agent.includes('Kobo') && ctx.request.body.kepubify && tools.kepubify) {
       // convert to Kobo EPUB
       conversion = 'kepubify'
       const outname = ctx.request.file.path.replace(/\.epub$/i, '.kepub.epub')
@@ -423,7 +443,7 @@ router.post('/upload', async (ctx, next) => {
         return
       }
 
-    } else if (mimetype == 'application/pdf' && ctx.request.body.pdfcropmargins) {
+    } else if (mimetype == 'application/pdf' && ctx.request.body.pdfcropmargins && tools.pdfcropmargins) {
       const dir = dirname(ctx.request.file.path)
       const base = basename(ctx.request.file.path, '.pdf')
       const outfile = resolvepath(join(dir, `${base}_cropped.pdf`))
@@ -556,6 +576,10 @@ router.get('/status/:key', async ctx => {
     } : null,
     urls: info.urls
   }
+})
+
+router.get('/tools', async ctx => {
+  ctx.body = tools
 })
 
 router.get('/receive', async ctx => {
